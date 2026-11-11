@@ -67,6 +67,13 @@ static const struct lpddr4_desc lpddr4_array[] = {
 		.timing = &ucm_dram_timing_01061010_2G
 #endif
 	},
+#ifdef CONFIG_DRAM_D4
+	{ .name = "Kingston",	.id = 0xff070010, .subind = 0x4, .size = 4096, .count = 1,
+#ifdef CONFIG_SPL_BUILD
+		.timing = &ucm_dram_timing_01061010_4G
+#endif
+	},
+#endif /* CONFIG_DRAM_D4 */
 };
 
 #else /* CONFIG_SPL_OS_BOOT */
