@@ -363,6 +363,24 @@ void *spl_load_simple_fit_fix_load(const void *fit);
 int spl_load_simple_fit(struct spl_image_info *spl_image,
 			struct spl_load_info *info, ulong sector, void *fdt);
 
+#if defined(CONFIG_TARGET_IOT_GATE_IMX8PLUS) && defined(CONFIG_SPL_OS_BOOT) && \
+	defined(CONFIG_SPL_LOAD_FIT) && !defined(CONFIG_IMX_HAB) && \
+	!defined(CONFIG_SPL_FIT_SIGNATURE) && !defined(CONFIG_IMX_TRUSTY_OS)
+#define SPL_IOT_GATE_FALCON_FIT 1
+#else
+#define SPL_IOT_GATE_FALCON_FIT 0
+#endif
+
+#if SPL_IOT_GATE_FALCON_FIT
+void falcon_malloc_snapshot(const char *checkpoint);
+
+int spl_load_simple_fit_falcon(struct spl_image_info *spl_image,
+			       struct spl_load_info *info, ulong sector,
+			       void *fdt, size_t header_size);
+
+int spl_falcon_validate_control_fdt(const void *fdt, size_t loaded);
+#endif
+
 #define SPL_COPY_PAYLOAD_ONLY	1
 #define SPL_FIT_FOUND		2
 #define SPL_FIT_BYPASS_POST_LOAD		4
@@ -865,8 +883,14 @@ int board_return_to_bootrom(struct spl_image_info *spl_image,
 /**
  * board_spl_fit_post_load - allow process images after loading finished
  * @fit: Pointer to a valid Flattened Image Tree blob
+ * @spl_image: Loaded image information
+ * @control_fdt_size: Exact number of control FDT payload bytes loaded,
+ *	or zero when no validated Falcon control FDT was loaded
+ *
+ * Return: 0 on success or a negative error code
  */
-void board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image);
+int board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image,
+			    size_t control_fdt_size);
 
 /**
  * board_spl_fit_size_align - specific size align before processing payload

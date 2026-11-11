@@ -321,6 +321,10 @@ static int spl_mmc_do_fs_boot(struct spl_image_info *spl_image,
 			partition);
 		if (!err)
 			return err;
+		if (SPL_IOT_GATE_FALCON_FIT) {
+			puts("SPL: Falcon load failed; refusing automatic fallback\n");
+			return err < 0 ? err : -EIO;
+		}
 	}
 #ifdef CONFIG_SPL_FS_LOAD_PAYLOAD_NAME
 	err = spl_load_image_fat(spl_image, bootdev, mmc_get_blk_desc(mmc),

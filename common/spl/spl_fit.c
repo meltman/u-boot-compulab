@@ -16,6 +16,7 @@
 #include <sysinfo.h>
 #include <asm/cache.h>
 #include <asm/global_data.h>
+#include <linux/kernel.h>
 #include <linux/libfdt.h>
 
 DECLARE_GLOBAL_DATA_PTR;
@@ -27,8 +28,10 @@ struct spl_fit_info {
 	int conf_node;		/* FDT offset to selected configuration node */
 };
 
-__weak void board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image)
+__weak int board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image,
+				   size_t control_fdt_size)
 {
+	return 0;
 }
 
 __weak ulong board_spl_fit_size_align(ulong size)
@@ -393,7 +396,7 @@ static int spl_fit_append_fdt(struct spl_image_info *spl_image,
 			      struct spl_load_info *info, ulong sector,
 			      const struct spl_fit_info *ctx)
 {
-	struct spl_image_info image_info;
+	struct spl_image_info image_info = { 0 };
 	int node, ret = 0, index = 0;
 
 	/*
@@ -721,7 +724,7 @@ static int spl_simple_fit_parse(struct spl_fit_info *ctx)
 int spl_load_simple_fit(struct spl_image_info *spl_image,
 			struct spl_load_info *info, ulong sector, void *fit)
 {
-	struct spl_image_info image_info;
+	struct spl_image_info image_info = { 0 };
 	struct spl_fit_info ctx;
 	int node = -1;
 	int ret;
@@ -838,7 +841,7 @@ int spl_load_simple_fit(struct spl_image_info *spl_image,
 			debug("Loadable is %s\n", genimg_get_os_name(os_type));
 
 		if (os_takes_devicetree(os_type)) {
-			spl_fit_append_fdt(&image_info, info, sector, &ctx);
+			ret = spl_fit_append_fdt(&image_info, info, sector, &ctx);
 			spl_image->fdt_addr = image_info.fdt_addr;
 		}
 
@@ -866,8 +869,240 @@ int spl_load_simple_fit(struct spl_image_info *spl_image,
 		spl_image->entry_point = spl_image->load_addr;
 
 	spl_image->flags |= SPL_FIT_FOUND;
-
-	board_spl_fit_post_load(ctx.fit, spl_image);
+	ret = board_spl_fit_post_load(ctx.fit, spl_image, 0);
+	if (ret) {
+		spl_image->flags &= ~SPL_FIT_FOUND;
+		return ret < 0 ? ret : -EINVAL;
+	}
 
 	return 0;
 }
+
+#if SPL_IOT_GATE_FALCON_FIT
+#define FALCON_FIT_MAX_SIZE	0x8000UL
+#define FALCON_CONTROL_BASE	0x43300000UL
+#define FALCON_CONTROL_END	0x43400000UL
+
+static int falcon_fdt_header(const void *blob, size_t loaded, size_t maximum,
+			     size_t *total)
+{
+	const struct fdt_header *header = blob;
+	u32 size;
+
+	if (!blob || loaded < sizeof(*header))
+		return -EIO;
+	if (fdt32_to_cpu(header->magic) != FDT_MAGIC)
+		return -EINVAL;
+	size = fdt32_to_cpu(header->totalsize);
+	if (size < sizeof(*header) || size > maximum || size > loaded)
+		return -EINVAL;
+	*total = size;
+	return 0;
+}
+
+int spl_falcon_validate_control_fdt(const void *fdt, size_t loaded)
+{
+	size_t total;
+	ulong base = (ulong)fdt;
+	int ret;
+
+	if (base != FALCON_CONTROL_BASE ||
+	    loaded > FALCON_CONTROL_END - FALCON_CONTROL_BASE)
+		return -EINVAL;
+	ret = falcon_fdt_header(fdt, loaded,
+				FALCON_CONTROL_END - FALCON_CONTROL_BASE, &total);
+	if (ret)
+		return ret;
+	if (base > ~0UL - total || base + total > FALCON_CONTROL_END)
+		return -EOVERFLOW;
+	return fdt_check_full(fdt, total) ? -EINVAL : 0;
+}
+
+static int falcon_string(const void *fit, int node, const char *prop,
+			 const char *expected, size_t expected_size)
+{
+	const void *value;
+	int len;
+
+	value = fdt_getprop(fit, node, prop, &len);
+	if (!value || len < 0 || (size_t)len != expected_size ||
+	    memcmp(value, expected, expected_size))
+		return -EINVAL;
+	return 0;
+}
+
+static int falcon_u32(const void *fit, int node, const char *prop, u32 *value)
+{
+	const fdt32_t *cell;
+	int len;
+
+	cell = fdt_getprop(fit, node, prop, &len);
+	if (!cell || len != (int)sizeof(*cell))
+		return -EINVAL;
+	*value = fdt32_to_cpu(*cell);
+	return 0;
+}
+
+struct falcon_component {
+	const char *name;
+	const char *type;
+	const char *os;
+	u32 load;
+	u32 limit;
+	bool entry;
+};
+
+static int falcon_load_component(const void *fit, int images,
+				 struct spl_load_info *info,
+				 const struct falcon_component *component,
+				 size_t *loaded)
+{
+	u32 position, size, load, entry;
+	ulong count;
+	int node;
+
+	node = fdt_subnode_offset(fit, images, component->name);
+	if (node < 0)
+		return -ENOENT;
+	if (falcon_u32(fit, node, "data-position", &position) ||
+	    falcon_u32(fit, node, "data-size", &size) ||
+	    falcon_u32(fit, node, "load", &load) ||
+	    falcon_string(fit, node, "type", component->type,
+			  strlen(component->type) + 1) ||
+	    falcon_string(fit, node, "arch", "arm64", sizeof("arm64")) ||
+	    falcon_string(fit, node, "compression", "none", sizeof("none")) ||
+	    (component->os &&
+	     falcon_string(fit, node, "os", component->os,
+			   strlen(component->os) + 1)))
+		return -EINVAL;
+	if (component->entry &&
+	    (falcon_u32(fit, node, "entry", &entry) || entry != component->load))
+		return -EINVAL;
+	if (load != component->load || !size || size > component->limit ||
+	    position < fdt_totalsize(fit) ||
+	    (position & (ARCH_DMA_MINALIGN - 1)) ||
+	    position > INT_MAX || size > INT_MAX - position)
+		return -EINVAL;
+
+	count = info->read(info, position, size, map_sysmem(load, size));
+	if (count != size) {
+		printf("SPL: Falcon %s read failed (%lu/%u)\n",
+		       component->name, count, size);
+		return -EIO;
+	}
+	*loaded = count;
+	return 0;
+}
+
+int spl_load_simple_fit_falcon(struct spl_image_info *spl_image,
+			       struct spl_load_info *info, ulong sector,
+			       void *header, size_t header_size)
+{
+	static const struct falcon_component components[] = {
+		{ "bl31", "firmware", "arm-trusted-firmware",
+		  0x00970000, 0x20000, true },
+		{ "kernel", "kernel", "linux", 0x48000000, 0x4000000, true },
+		{ "tee", "firmware", "tee", 0x56000000, 0x1e00000, true },
+		{ "control-fdt", "flat_dt", NULL, FALCON_CONTROL_BASE,
+		  FALCON_CONTROL_END - FALCON_CONTROL_BASE, false },
+	};
+	static const char loadables[] = "kernel\0tee";
+	struct spl_image_info image = *spl_image;
+	size_t total, reread_total, loaded = 0, firmware_size = 0;
+	void *fit;
+	ulong count;
+	int conf, images, ret;
+	size_t i;
+
+#if !defined(CONFIG_SPL_OF_LIBFDT_ASSUME_MASK) || CONFIG_SPL_OF_LIBFDT_ASSUME_MASK != 0
+	puts("SPL: Falcon requires checked libfdt\n");
+	return -EINVAL;
+#endif
+	if (!info || !info->read || !info->filename || info->bl_len != 1 || sector)
+		return -EINVAL;
+	if (image.flags & SPL_FIT_BYPASS_POST_LOAD)
+		return -EINVAL;
+	/* The FAT caller has read the complete initial header. */
+	if (!header || header_size < sizeof(struct fdt_header) ||
+	    fdt32_to_cpu(((struct fdt_header *)header)->magic) != FDT_MAGIC) {
+		puts("SPL: invalid Falcon FIT header\n");
+		return -EINVAL;
+	}
+	total = fdt32_to_cpu(((struct fdt_header *)header)->totalsize);
+	if (total < sizeof(struct fdt_header) || total > FALCON_FIT_MAX_SIZE) {
+		printf("SPL: invalid Falcon FIT metadata size: %lu\n", (ulong)total);
+		return -EINVAL;
+	}
+	falcon_malloc_snapshot("start");
+	fit = malloc_cache_aligned(total);
+	if (!fit) {
+		printf("SPL: FIT metadata allocation failed: %lu bytes\n",
+		       (ulong)total);
+		falcon_malloc_snapshot("fail-fit-meta");
+		return -ENOMEM;
+	}
+	count = info->read(info, 0, total, fit);
+	if (count != total) {
+		printf("SPL: incomplete FIT metadata read (%lu/%lu)\n",
+		       count, (ulong)total);
+		ret = -EIO;
+		goto out;
+	}
+	ret = falcon_fdt_header(fit, count, FALCON_FIT_MAX_SIZE, &reread_total);
+	if (ret || reread_total != total || fdt_check_full(fit, total)) {
+		puts("SPL: invalid Falcon FIT metadata\n");
+		ret = -EINVAL;
+		goto out;
+	}
+	falcon_malloc_snapshot("fit-meta");
+	conf = fdt_path_offset(fit, "/configurations/conf-falcon");
+	images = fdt_path_offset(fit, "/images");
+	if (conf < 0 || images < 0 ||
+	    falcon_string(fit, conf, "firmware", "bl31", sizeof("bl31")) ||
+	    falcon_string(fit, conf, "loadables", loadables, sizeof(loadables)) ||
+	    falcon_string(fit, conf, "fdt", "control-fdt", sizeof("control-fdt"))) {
+		puts("SPL: invalid Falcon FIT configuration\n");
+		ret = -EINVAL;
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(components); i++) {
+		ret = falcon_load_component(fit, images, info, &components[i],
+					    &loaded);
+		if (ret) {
+			printf("SPL: invalid Falcon component %s (%d)\n",
+			       components[i].name, ret);
+			goto out;
+		}
+		if (!i)
+			firmware_size = loaded;
+		if (i == 1)
+			falcon_malloc_snapshot("kernel");
+		else if (i == 2)
+			falcon_malloc_snapshot("tee");
+		else if (i == 3)
+			falcon_malloc_snapshot("control-fdt");
+	}
+	image.load_addr = components[0].load;
+	image.size = firmware_size;
+	image.fdt_addr = map_sysmem(FALCON_CONTROL_BASE, loaded);
+	ret = spl_falcon_validate_control_fdt(image.fdt_addr, loaded);
+	if (ret) {
+		puts("SPL: invalid Falcon control FDT\n");
+		goto out;
+	}
+	ret = board_spl_fit_post_load(fit, &image, loaded);
+	if (ret) {
+		if (ret > 0)
+			ret = -EINVAL;
+		goto out;
+	}
+	falcon_malloc_snapshot("rdc");
+	image.entry_point = components[0].load;
+	image.os = IH_OS_ARM_TRUSTED_FIRMWARE;
+	image.flags |= SPL_FIT_FOUND;
+	*spl_image = image;
+out:
+	free(fit);
+	return ret;
+}
+#endif

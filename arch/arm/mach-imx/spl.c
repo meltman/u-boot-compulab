@@ -402,6 +402,9 @@ void *spl_load_simple_fit_fix_load(const void *fit)
 	unsigned long size;
 	u8 *tmp = (u8 *)fit;
 
+	if (!IS_ENABLED(CONFIG_IMX_HAB))
+		return (void *)fit;
+
 	if (IS_ENABLED(CONFIG_IMX_HAB)) {
 		if (IS_ENABLED(CONFIG_IMX_SPL_FIT_FDT_SIGNATURE)) {
 			u32 offset = ALIGN(fdt_totalsize(fit), 0x1000);
@@ -453,6 +456,11 @@ int board_handle_rdc_config(void *fdt_addr, const char *config_name, void *dst_a
 	uint32_t *data = NULL;
 	const struct fdt_property *prop;
 
+	if (!fdt_addr) {
+		puts("SPL: missing RDC control FDT\n");
+		return -EINVAL;
+	}
+
 	node = fdt_node_offset_by_compatible(fdt_addr, -1, "imx8m,mcu_rdc");
 	if (node < 0) {
 		printf("Failed to find node!, err: %d!\n", node);
@@ -470,12 +478,21 @@ int board_handle_rdc_config(void *fdt_addr, const char *config_name, void *dst_a
 		ret = -1;
 		goto exit;
 	}
-	if (!size || size % (5 * sizeof(uint32_t))) {
+	if (size <= 0 || size % (5 * sizeof(uint32_t))) {
 		printf("Config size is wrong! size:%d\n", size);
 		ret = -1;
 		goto exit;
 	}
 	data = malloc(size);
+	if (!data) {
+		printf("SPL: RDC allocation failed for %s: %d bytes\n",
+		       config_name, size);
+#if SPL_IOT_GATE_FALCON_FIT
+		falcon_malloc_snapshot("fail-rdc");
+#endif
+		ret = -ENOMEM;
+		goto exit;
+	}
 	if (fdtdec_get_int_array(fdt_addr, node, config_name,
 				 data, size/sizeof(int))) {
 		printf("Failed to parse rdc config!\n");
@@ -506,8 +523,53 @@ exit:
 #define LZ4_MAGIC_NUM     0x184D2204
 #endif
 
-void board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image)
+#if SPL_IOT_GATE_FALCON_FIT
+static int falcon_validate_rdc(const void *fdt, size_t loaded)
 {
+	static const struct {
+		const char *name;
+		int max_size;
+	} properties[] = {
+		{ "start-config", 280 },
+		{ "stop-config", 60 },
+	};
+	const fdt32_t *data;
+	int node, len, ret;
+	size_t i;
+
+	ret = spl_falcon_validate_control_fdt(fdt, loaded);
+	if (ret)
+		return ret;
+	node = fdt_path_offset(fdt, "/mcu_rdc");
+	if (node < 0 ||
+	    fdt_node_check_compatible(fdt, node, "imx8m,mcu_rdc") ||
+	    fdt_node_offset_by_compatible(fdt, -1, "imx8m,mcu_rdc") != node) {
+		puts("SPL: missing Falcon /mcu_rdc\n");
+		return -EINVAL;
+	}
+	/*
+	 * Limit copies to the sizes already used by this board's control DT.
+	 * Each five-cell array is terminated by an RDC_INVALID record.
+	 */
+	for (i = 0; i < ARRAY_SIZE(properties); i++) {
+		data = fdt_getprop(fdt, node, properties[i].name, &len);
+		if (!data || len <= 0 || len > properties[i].max_size ||
+		    len % (5 * sizeof(*data)) ||
+		    fdt32_to_cpu(data[len / sizeof(*data) - 5]) != 0) {
+			printf("SPL: invalid RDC property %s\n", properties[i].name);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+#endif
+
+int board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image,
+			    size_t control_fdt_size)
+{
+#if defined(CONFIG_IMX8MP) || defined(CONFIG_IMX8MN) || defined(CONFIG_IMX_TRUSTY_OS)
+	int ret;
+#endif
 
 #ifdef CONFIG_IMX_TRUSTY_OS
 	int tee_node;
@@ -515,7 +577,6 @@ void board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image)
 	int size;
 	void *offset_addr;
 	size_t dest_size;
-	int ret;
 #endif
 
 	if (IS_ENABLED(CONFIG_IMX_HAB) && !(spl_image->flags & SPL_FIT_BYPASS_POST_LOAD)) {
@@ -530,12 +591,26 @@ void board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image)
 #if defined(CONFIG_IMX8MP) || defined(CONFIG_IMX8MN)
 #define MCU_RDC_MAGIC "mcu_rdc"
 	if (!(spl_image->flags & SPL_FIT_BYPASS_POST_LOAD)) {
+#if SPL_IOT_GATE_FALCON_FIT
+		if (control_fdt_size) {
+			ret = falcon_validate_rdc(spl_image->fdt_addr,
+						  control_fdt_size);
+			if (ret)
+				goto rdc_error;
+		}
+#endif
 		memcpy((void *)CONFIG_IMX8M_MCU_RDC_START_CONFIG_ADDR, MCU_RDC_MAGIC, ALIGN(strlen(MCU_RDC_MAGIC), 4));
 		memcpy((void *)CONFIG_IMX8M_MCU_RDC_STOP_CONFIG_ADDR, MCU_RDC_MAGIC, ALIGN(strlen(MCU_RDC_MAGIC), 4));
-		board_handle_rdc_config(spl_image->fdt_addr, "start-config",
-					(void *)(CONFIG_IMX8M_MCU_RDC_START_CONFIG_ADDR + ALIGN(strlen(MCU_RDC_MAGIC), 4)));
-		board_handle_rdc_config(spl_image->fdt_addr, "stop-config",
-					(void *)(CONFIG_IMX8M_MCU_RDC_STOP_CONFIG_ADDR + ALIGN(strlen(MCU_RDC_MAGIC), 4)));
+		ret = board_handle_rdc_config(spl_image->fdt_addr, "start-config",
+					      (void *)(CONFIG_IMX8M_MCU_RDC_START_CONFIG_ADDR +
+						       ALIGN(strlen(MCU_RDC_MAGIC), 4)));
+		if (ret < 0)
+			goto rdc_error;
+		ret = board_handle_rdc_config(spl_image->fdt_addr, "stop-config",
+					      (void *)(CONFIG_IMX8M_MCU_RDC_STOP_CONFIG_ADDR +
+						       ALIGN(strlen(MCU_RDC_MAGIC), 4)));
+		if (ret < 0)
+			goto rdc_error;
 	}
 #endif
 
@@ -544,13 +619,13 @@ void board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image)
                 tee_node = fit_image_get_node(fit, TEE_SUBNODE_NAME);
                 if (tee_node < 0) {
                         printf ("Can't find FIT subimage\n");
-                        return;
+			return tee_node;
                 }
 
                 ret = fit_image_get_load(fit, tee_node, &load_addr);
                 if (ret) {
                         printf("Can't get image load address!\n");
-                        return;
+			return ret < 0 ? ret : -EINVAL;
                 }
 
                 if (*(u32*)load_addr == LZ4_MAGIC_NUM) {
@@ -559,7 +634,7 @@ void board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image)
                         ret = fit_image_get_data_size(fit, tee_node, &size);
                         if (ret < 0) {
                                 printf("Can't get size of image (err=%d)\n", ret);
-                                return;
+				return ret;
                         }
 
                         memcpy(offset_addr,(void *)load_addr, size);
@@ -568,7 +643,7 @@ void board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image)
                         ret = ulz4fn((void *)offset_addr, size, (void *)load_addr, &dest_size);
                         if (ret) {
                                 printf("Uncompressed err :%d\n", ret);
-                                return;
+				return ret < 0 ? ret : -EINVAL;
                         }
 #if CONFIG_IS_ENABLED(LOAD_FIT) || CONFIG_IS_ENABLED(LOAD_FIT_FULL)
                         /* Modify the image size had recorded in FDT */
@@ -578,6 +653,16 @@ void board_spl_fit_post_load(const void *fit, struct spl_image_info *spl_image)
         }
 #endif
 
+	return 0;
+
+#if defined(CONFIG_IMX8MP) || defined(CONFIG_IMX8MN)
+rdc_error:
+	memset((void *)CONFIG_IMX8M_MCU_RDC_START_CONFIG_ADDR, 0,
+	       ALIGN(strlen(MCU_RDC_MAGIC), 4));
+	memset((void *)CONFIG_IMX8M_MCU_RDC_STOP_CONFIG_ADDR, 0,
+	       ALIGN(strlen(MCU_RDC_MAGIC), 4));
+	return ret;
+#endif
 }
 
 #if defined(CONFIG_IMX_TRUSTY_OS) && !defined(CONFIG_IMX_MATTER_TRUSTY)

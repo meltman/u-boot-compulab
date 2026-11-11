@@ -19,6 +19,9 @@
 #include <malloc.h>
 #include <asm/io.h>
 #include <valgrind/memcheck.h>
+#ifdef CONFIG_SPL_BUILD
+#include <spl.h>
+#endif
 
 #ifdef DEBUG
 #if __STD_C
@@ -2338,6 +2341,31 @@ size_t malloc_usable_size(mem) Void_t* mem;
 
 
 /* Utility to update current_mallinfo for malloc_stats and mallinfo() */
+
+#ifdef CONFIG_SPL_BUILD
+#if SPL_IOT_GATE_FALCON_FIT
+void falcon_malloc_snapshot(const char *checkpoint)
+{
+	unsigned long free_chunks = 0, reserved, unreserved;
+	mbinptr bin;
+	mchunkptr chunk;
+	int i;
+
+	reserved = mem_malloc_brk - mem_malloc_start;
+	unreserved = mem_malloc_end - mem_malloc_brk;
+	if (top != initial_top)
+		free_chunks = chunksize(top);
+	for (i = 1; i < NAV; i++) {
+		bin = bin_at(i);
+		for (chunk = last(bin); chunk != bin; chunk = chunk->bk)
+			free_chunks += chunksize(chunk);
+	}
+	printf("FALCON_MEM: %s arena=%lu reserved=%lu free_chunks=%lu unreserved=%lu\n",
+	       checkpoint, mem_malloc_end - mem_malloc_start, reserved,
+	       free_chunks, unreserved);
+}
+#endif
+#endif
 
 #ifdef DEBUG
 static void malloc_update_mallinfo()

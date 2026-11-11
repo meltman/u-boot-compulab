@@ -874,6 +874,11 @@ void board_init_r(gd_t *dummy1, ulong dummy2)
 	case IH_OS_ARM_TRUSTED_FIRMWARE:
 		debug("Jumping to U-Boot via ARM Trusted Firmware\n");
 		spl_fixup_fdt(spl_image.fdt_addr);
+#if SPL_IOT_GATE_FALCON_FIT
+		if ((spl_image.flags & SPL_FIT_FOUND) &&
+		    spl_image.fdt_addr == (void *)0x43300000UL)
+			falcon_malloc_snapshot("before-bl31");
+#endif
 		spl_invoke_atf(&spl_image);
 		break;
 #endif
